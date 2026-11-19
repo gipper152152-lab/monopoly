@@ -580,7 +580,7 @@ button{font-family:inherit}
         <button class="act" id="retryOnlineBtn" style="display:none" type="button">ПОВТОРИТЬ</button>
         <button class="act" id="leaveRoomBtn" style="display:none" type="button">ВЫЙТИ</button>
       </div>
-      <p class="online-hint">Хост: «СОЗДАТЬ» → передать код. Гость: ввести код → «ВОЙТИ», не «Создать». Вкладка хоста должна оставаться открытой. Соединение — PeerJS.</p>
+      <p class="online-hint" id="onlineHint">Хост: «СОЗДАТЬ» → код. Гость: код → «ВОЙТИ». Вкладка хоста открыта. Соединение — WebSocket.</p>
     </div>
   </div>
 </div>
@@ -643,7 +643,18 @@ const BRAND_MONOGRAMS = {
 };
 const SPECIAL_ICONS = { start:"flag", chance:"sparkles", jail:"lock", parking:"square-parking", bank:"landmark" };
 const PEER_HOST = "kyle-kirk-onion-let.trycloudflare.com";
-const PEER_OPTS = PEER_HOST ? { host: PEER_HOST, port: 443, path: "/peerjs", secure: true, debug: 1 } : { debug: 1 };
+const PEER_OPTS = PEER_HOST ? {
+  host: PEER_HOST, port: 443, path: "/peerjs", secure: true, debug: 1,
+  config: {
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+      { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+      { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
+      { urls: "turns:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" }
+    ]
+  }
+} : { debug: 1 };
 function assetUrl(rel) {
   if (typeof EMBEDDED_ASSETS !== "undefined" && EMBEDDED_ASSETS[rel]) return EMBEDDED_ASSETS[rel];
   return "assets/" + rel;
@@ -700,7 +711,7 @@ const S = {
 };
 const NET = {
   role: null, peer: null, conn: null, conns: [], code: "", playerId: 0,
-  lobby: [], started: false
+  lobby: [], started: false, ws: null, clientId: ""
 };
 function myPlayerId() { return NET.role === "guest" ? NET.playerId : 0; }
 let tileEls = [];
@@ -954,9 +965,7 @@ function broadcastState() {
   clearTimeout(bcTimer);
   bcTimer = setTimeout(() => {
     const st = snapshot();
-    NET.conns.forEach(c => {
-      try { if (c.conn && c.conn.open) c.conn.send({ t: "state", state: st }); } catch (e) { /* ignore */ }
-    });
+    wsSend({ t: "state", state: st });
   }, 35);
 }
 
@@ -1005,9 +1014,7 @@ function showRetry(show) {
   if (b) b.style.display = show ? "inline-block" : "none";
 }
 function sendAction(action) {
-  if (NET.role === "guest" && NET.started && NET.conn && NET.conn.open) {
-    try { NET.conn.send({ t: "action", action }); } catch (e) { /* ignore */ }
-  }
+  if (NET.role === "guest" && NET.started) wsSend({ t: "action", action });
 }
 
 function renderLobby() {
@@ -1028,103 +1035,109 @@ function renderLobby() {
 
 function openOnline() {
   $("#onlineModal").classList.add("show");
+  const h = $("#onlineHint");
+  if (h) h.textContent = (PEER_HOST ? "Сервер: " + PEER_HOST + ". " : "Сервер: PeerJS Cloud. ") + "Хост: «СОЗДАТЬ» → код; гость: код → «ВОЙТИ». Вкладка хоста открыта.";
   renderLobby();
   if (!NET.role) setOnlineStatus("Создайте комнату или введите код комнаты.");
 }
 function closeOnline() { $("#onlineModal").classList.remove("show"); }
 
+function newClientId(prefix) {
+  return prefix + Math.random().toString(36).slice(2, 10);
+}
+function wsUrl(role, code, clientId, name) {
+  return "wss://" + PEER_HOST + "/ws?room=" + encodeURIComponent(code) +
+    "&role=" + role + "&clientId=" + encodeURIComponent(clientId) +
+    "&name=" + encodeURIComponent(name);
+}
+function wsSend(obj) {
+  if (NET.ws && NET.ws.readyState === 1) {
+    try { NET.ws.send(JSON.stringify(obj)); } catch (e) { /* ignore */ }
+  }
+}
+function wsClose() {
+  try { if (NET.ws) NET.ws.close(); } catch (e) { /* ignore */ }
+  NET.ws = null;
+}
+
 function createRoom() {
   if (NET.role || NET.creating) return;
-  if (typeof Peer === "undefined") { setOnlineStatus("PeerJS не загрузился. Проверьте интернет."); return; }
   NET.creating = true;
   const name = cleanName($("#onlineName").value);
-  let attempt = 0;
-  const tryCreate = () => {
-    const code = genRoomCode();
-    setOnlineStatus("Создаём комнату " + code + "…");
-    const peer = new Peer("monopoly-club-" + code, PEER_OPTS);
-    let opened = false;
-    peer.on("open", () => {
-      opened = true;
-      NET.creating = false;
-      NET.role = "host";
-      NET.peer = peer;
-      NET.code = code;
-      NET.started = false;
-      NET.conns = [];
-      NET.lobby = [{ id: 0, name }];
-      showRetry(false);
-      setOnlineStatus(`Комната ${code} создана. Передайте код друзьям.`);
-      $("#roomCodeInput").value = code;
-      renderLobby();
-      peer.on("connection", conn => setupHostConnection(conn));
-    });
-    peer.on("error", err => {
-      NET.creating = false;
-      if (!opened && err.type === "unavailable-id" && attempt < 3) {
-        attempt++;
-        try { peer.destroy(); } catch (e) { /* ignore */ }
-        tryCreate();
-      } else {
-        showRetry(true);
-        setOnlineStatus("Ошибка сети: " + (err.type || "peer") + ". Нажмите «ПОВТОРИТЬ».");
-      }
-    });
-    peer.on("disconnected", () => {
-      showRetry(true);
-      setOnlineStatus("Связь с сервером комнат потеряна, переподключаемся…");
-      setTimeout(() => { try { if (!peer.destroyed) peer.reconnect(); } catch (e) { /* ignore */ } }, 900);
-    });
-    peer.on("close", () => {
-      showRetry(true);
-      setOnlineStatus("Соединение PeerJS закрыто. Нажмите «ПОВТОРИТЬ».");
-    });
+  const code = genRoomCode();
+  const clientId = newClientId("h_");
+  NET.clientId = clientId;
+  showRetry(false);
+  setOnlineStatus("Создаём комнату " + code + "…");
+  let ws;
+  try { ws = new WebSocket(wsUrl("host", code, clientId, name)); }
+  catch (e) { NET.creating = false; setOnlineStatus("WebSocket не поддерживается."); return; }
+  NET.ws = ws;
+  let opened = false;
+  ws.onopen = () => {
+    opened = true;
+    NET.creating = false;
+    NET.role = "host";
+    NET.code = code;
+    NET.started = false;
+    NET.conns = [];
+    NET.lobby = [{ id: 0, name }];
+    showRetry(false);
+    setOnlineStatus(`Комната ${code} создана. Передайте код друзьям.`);
+    $("#roomCodeInput").value = code;
+    renderLobby();
   };
-  tryCreate();
+  ws.onmessage = ev => {
+    let d;
+    try { d = JSON.parse(ev.data); } catch (e) { return; }
+    if (d && d.t) handleHostSocket(d);
+  };
+  ws.onerror = () => {
+    NET.creating = false;
+    if (!opened) {
+      showRetry(true);
+      setOnlineStatus("Не удалось подключиться к серверу комнат. Нажмите «ПОВТОРИТЬ».");
+    }
+  };
+  ws.onclose = () => {
+    NET.creating = false;
+    showRetry(true);
+    if (NET.role === "host") {
+      NET.started = false;
+      setOnlineStatus("Сервер комнат закрыт. Нажмите «ПОВТОРИТЬ».");
+    }
+  };
 }
 
 function rebuildLobby() {
   const hostName = (NET.lobby[0] && NET.lobby[0].name) || cleanName($("#onlineName").value);
   NET.conns.forEach((c, i) => { c.slot = i + 1; });
-  NET.lobby = [{ id: 0, name: hostName }, ...NET.conns.map((c, i) => ({ id: i + 1, name: c.name }))];
+  NET.lobby = [{ id: 0, name: hostName }, ...NET.conns.map((c, i) => ({ id: i + 1, name: c.name, clientId: c.clientId }))];
   broadcastLobby();
 }
 
 function broadcastLobby() {
-  const msg = { t: "lobby", code: NET.code, players: NET.lobby, started: NET.started };
-  NET.conns.forEach(c => {
-    try { if (c.conn.open) c.conn.send(msg); } catch (e) { /* ignore */ }
-  });
+  wsSend({ t: "lobby", code: NET.code, players: NET.lobby, started: NET.started });
   renderLobby();
 }
 
-function setupHostConnection(conn) {
-  conn.on("data", data => {
-    if (!data || typeof data !== "object") return;
-    if (data.t === "join") {
-      if (NET.started || NET.conns.length >= 3) {
-        try { conn.send({ t: "full" }); } catch (e) { /* ignore */ }
-        setTimeout(() => { try { conn.close(); } catch (e) { /* ignore */ } }, 300);
-        return;
-      }
-      if (NET.conns.some(c => c.conn === conn)) return;
-      const name = cleanName(data.name);
-      NET.conns.push({ conn, slot: NET.conns.length + 1, name });
-      rebuildLobby();
-      const slot = NET.conns.find(c => c.conn === conn).slot;
-      try { conn.send({ t: "welcome", playerId: slot, code: NET.code }); } catch (e) { /* ignore */ }
-      setOnlineStatus(`${name} подключился.`);
-      renderLobby();
-    } else if (data.t === "action" && NET.started) {
-      const meta = NET.conns.find(c => c.conn === conn);
-      if (meta) hostRemoteAction(meta.slot, data.action);
+function handleHostSocket(data) {
+  if (data.t === "join") {
+    if (NET.started || NET.conns.length >= 3) {
+      wsSend({ t: "full" });
+      setOnlineStatus("Комната заполнена.");
+      return;
     }
-  });
-  conn.on("close", () => {
-    const idx = NET.conns.findIndex(c => c.conn === conn);
+    if (NET.conns.some(c => c.clientId === data.clientId)) return;
+    const name = cleanName(data.name);
+    NET.conns.push({ clientId: data.clientId, slot: NET.conns.length + 1, name });
+    rebuildLobby();
+    setOnlineStatus(`${name} подключился.`);
+    renderLobby();
+  } else if (data.t === "leave") {
+    const idx = NET.conns.findIndex(c => c.clientId === data.clientId);
     if (idx < 0) return;
-    const meta = NET.conns[idx];
-    NET.conns.splice(idx, 1);
+    const meta = NET.conns.splice(idx, 1)[0];
     if (!NET.started) {
       rebuildLobby();
       setOnlineStatus(`${meta.name} отключился.`);
@@ -1138,8 +1151,10 @@ function setupHostConnection(conn) {
         renderAll();
       }
     }
-  });
-  conn.on("error", () => { /* ignore */ });
+  } else if (data.t === "action" && NET.started) {
+    const meta = NET.conns.find(c => c.clientId === data.from);
+    if (meta) hostRemoteAction(meta.slot, data.action);
+  }
 }
 
 function hostRemoteAction(slot, action) {
@@ -1166,9 +1181,9 @@ function startOnlineGame() {
   S.players[0].remote = false;
   S.result = null;
   NET.started = true;
-  NET.conns.forEach(c => {
-    try { if (c.conn.open) c.conn.send({ t: "start", playerId: c.slot }); } catch (e) { /* ignore */ }
-  });
+  const slots = {};
+  NET.conns.forEach(c => { slots[c.clientId] = c.slot; });
+  wsSend({ t: "start", slots });
   addLog("Онлайн-партия началась. Удачи!", "🌐");
   $("#restartBtn").disabled = true;
   closeOnline();
@@ -1177,7 +1192,6 @@ function startOnlineGame() {
 
 function joinRoom() {
   if (NET.role) return;
-  if (typeof Peer === "undefined") { setOnlineStatus("PeerJS не загрузился. Проверьте интернет."); return; }
   const code = String($("#roomCodeInput").value || "").trim().toUpperCase();
   if (code.length < 4) { setOnlineStatus("Введите 4-символьный код комнаты."); return; }
   const name = cleanName($("#onlineName").value);
@@ -1186,56 +1200,47 @@ function joinRoom() {
   NET.started = false;
   NET.playerId = 0;
   NET.lobby = [];
+  NET.conns = [];
+  NET.clientId = newClientId("g_");
   $("#restartBtn").disabled = true;
   showRetry(false);
   setOnlineStatus("Подключаемся к " + code + "…");
-  const peer = new Peer(PEER_OPTS);
-  NET.peer = peer;
-  peer.on("open", () => {
+  let ws;
+  try { ws = new WebSocket(wsUrl("guest", code, NET.clientId, name)); }
+  catch (e) { setOnlineStatus("WebSocket не поддерживается."); return; }
+  NET.ws = ws;
+  ws.onopen = () => {
     showRetry(false);
-    const conn = peer.connect("monopoly-club-" + code, { reliable: true });
-    NET.conn = conn;
-    const to = setTimeout(() => { if (!conn.open) setOnlineStatus("Хост не отвечает. Проверьте код."); }, 10000);
-    conn.on("open", () => {
-      clearTimeout(to);
-      showRetry(false);
-      try { conn.send({ t: "join", name }); } catch (e) { /* ignore */ }
-      setOnlineStatus("Подключено. Ждём старта хоста.");
-    });
-    conn.on("data", handleGuestData);
-    conn.on("close", () => {
-      clearTimeout(to);
-      showRetry(true);
-      setOnlineStatus("Соединение с хостом закрыто. Нажмите «ПОВТОРИТЬ».");
-      NET.started = false;
-    });
-    conn.on("error", () => {
-      showRetry(true);
-      setOnlineStatus("Ошибка соединения. Нажмите «ПОВТОРИТЬ».");
-    });
-  });
-  peer.on("error", err => {
+    setOnlineStatus("Подключено. Ждём старта хоста.");
+  };
+  ws.onmessage = ev => {
+    let d;
+    try { d = JSON.parse(ev.data); } catch (e) { return; }
+    if (d && d.t) handleGuestSocket(d);
+  };
+  ws.onerror = () => {
     showRetry(true);
-    setOnlineStatus("Ошибка сети: " + (err.type || "peer") + ". Нажмите «ПОВТОРИТЬ».");
-  });
-  peer.on("disconnected", () => {
+    setOnlineStatus("Ошибка соединения. Нажмите «ПОВТОРИТЬ».");
+  };
+  ws.onclose = ev => {
     showRetry(true);
-    setOnlineStatus("Связь с сервером комнат потеряна, переподключаемся…");
-    setTimeout(() => { try { if (!peer.destroyed) peer.reconnect(); } catch (e) { /* ignore */ } }, 900);
-  });
+    NET.started = false;
+    if (ev.code === 4004) setOnlineStatus("Комната не найдена. Проверьте код.");
+    else if (ev.code === 4002) setOnlineStatus("Комната заполнена (максимум 4 игрока).");
+    else setOnlineStatus("Соединение с комнатой закрыто. Нажмите «ПОВТОРИТЬ».");
+  };
 }
 
-function handleGuestData(data) {
-  if (!data || typeof data !== "object") return;
+function handleGuestSocket(data) {
   if (data.t === "lobby") {
     NET.lobby = data.players || [];
     NET.code = data.code || NET.code;
+    const me = NET.lobby.find(p => p.clientId === NET.clientId);
+    if (me) NET.playerId = me.id;
     renderLobby();
     setOnlineStatus(`Комната ${NET.code}: ${NET.lobby.length} игрок(ов). Ждём старта.`);
-  } else if (data.t === "welcome") {
-    NET.playerId = data.playerId || 0;
   } else if (data.t === "start") {
-    NET.playerId = data.playerId || 0;
+    NET.playerId = (data.slots && data.slots[NET.clientId]) || NET.playerId || 0;
     NET.started = true;
     S.gameId++;
     S.over = false;
@@ -1248,17 +1253,12 @@ function handleGuestData(data) {
     applyState(data.state);
   } else if (data.t === "full") {
     setOnlineStatus("Комната заполнена (максимум 4 игрока).");
+    wsClose();
   }
 }
 
 function leaveRoom() {
-  if (NET.role === "guest") {
-    try { if (NET.conn) NET.conn.close(); } catch (e) { /* ignore */ }
-    try { if (NET.peer) NET.peer.destroy(); } catch (e) { /* ignore */ }
-  } else if (NET.role === "host") {
-    NET.conns.forEach(c => { try { c.conn.close(); } catch (e) { /* ignore */ } });
-    try { if (NET.peer) NET.peer.destroy(); } catch (e) { /* ignore */ }
-  }
+  wsClose();
   NET.role = null;
   NET.conn = null;
   NET.peer = null;
@@ -1272,14 +1272,14 @@ function leaveRoom() {
 }
 
 function resetOnlineState() {
-  try { if (NET.conn) NET.conn.close(); } catch (e) { /* ignore */ }
-  try { if (NET.peer) NET.peer.destroy(); } catch (e) { /* ignore */ }
+  wsClose();
   NET.role = null;
   NET.conn = null;
   NET.peer = null;
   NET.conns = [];
   NET.creating = false;
   NET.code = "";
+  NET.clientId = "";
   NET.playerId = 0;
   NET.lobby = [];
   NET.started = false;
@@ -1711,11 +1711,6 @@ function bindEvents() {
     }
   });
 
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && NET.peer && NET.peer.disconnected && !NET.peer.destroyed) {
-      try { NET.peer.reconnect(); } catch (e) { /* ignore */ }
-    }
-  });
 }
 
 buildBoard();
