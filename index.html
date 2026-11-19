@@ -577,9 +577,10 @@ button{font-family:inherit}
       <div id="lobbyList" class="lobby-list"></div>
       <div class="online-actions">
         <button class="act primary" id="startRoomBtn" style="display:none" type="button">НАЧАТЬ ИГРУ</button>
+        <button class="act" id="retryOnlineBtn" style="display:none" type="button">ПОВТОРИТЬ</button>
         <button class="act" id="leaveRoomBtn" style="display:none" type="button">ВЫЙТИ</button>
       </div>
-      <p class="online-hint">Хост создаёт комнату и передаёт код. До 4 игроков; свободные места занимают ИИ. Нужен интернет — соединение идёт через PeerJS.</p>
+      <p class="online-hint">Хост: «СОЗДАТЬ» → передать код. Гость: ввести код → «ВОЙТИ», не «Создать». Вкладка хоста должна оставаться открытой. Соединение — PeerJS.</p>
     </div>
   </div>
 </div>
@@ -997,6 +998,10 @@ function setOnlineStatus(text) {
   const el = $("#onlineStatus");
   if (el) el.textContent = text;
 }
+function showRetry(show) {
+  const b = $("#retryOnlineBtn");
+  if (b) b.style.display = show ? "inline-block" : "none";
+}
 function sendAction(action) {
   if (NET.role === "guest" && NET.started && NET.conn && NET.conn.open) {
     try { NET.conn.send({ t: "action", action }); } catch (e) { /* ignore */ }
@@ -1046,6 +1051,7 @@ function createRoom() {
       NET.started = false;
       NET.conns = [];
       NET.lobby = [{ id: 0, name }];
+      showRetry(false);
       setOnlineStatus(`Комната ${code} создана. Передайте код друзьям.`);
       $("#roomCodeInput").value = code;
       renderLobby();
@@ -1058,14 +1064,19 @@ function createRoom() {
         try { peer.destroy(); } catch (e) { /* ignore */ }
         tryCreate();
       } else {
-        setOnlineStatus("Ошибка сети: " + (err.type || "peer"));
+        showRetry(true);
+        setOnlineStatus("Ошибка сети: " + (err.type || "peer") + ". Нажмите «ПОВТОРИТЬ».");
       }
     });
     peer.on("disconnected", () => {
-      setOnlineStatus("Сигнальная связь потеряна, переподключаемся…");
+      showRetry(true);
+      setOnlineStatus("Связь с сервером комнат потеряна, переподключаемся…");
       setTimeout(() => { try { if (!peer.destroyed) peer.reconnect(); } catch (e) { /* ignore */ } }, 900);
     });
-    peer.on("close", () => setOnlineStatus("Соединение PeerJS закрыто."));
+    peer.on("close", () => {
+      showRetry(true);
+      setOnlineStatus("Соединение PeerJS закрыто. Нажмите «ПОВТОРИТЬ».");
+    });
   };
   tryCreate();
 }
@@ -1174,29 +1185,40 @@ function joinRoom() {
   NET.playerId = 0;
   NET.lobby = [];
   $("#restartBtn").disabled = true;
+  showRetry(false);
   setOnlineStatus("Подключаемся к " + code + "…");
   const peer = new Peer({ debug: 1 });
   NET.peer = peer;
   peer.on("open", () => {
+    showRetry(false);
     const conn = peer.connect("monopoly-club-" + code, { reliable: true });
     NET.conn = conn;
     const to = setTimeout(() => { if (!conn.open) setOnlineStatus("Хост не отвечает. Проверьте код."); }, 10000);
     conn.on("open", () => {
       clearTimeout(to);
+      showRetry(false);
       try { conn.send({ t: "join", name }); } catch (e) { /* ignore */ }
       setOnlineStatus("Подключено. Ждём старта хоста.");
     });
     conn.on("data", handleGuestData);
     conn.on("close", () => {
       clearTimeout(to);
-      setOnlineStatus("Соединение с хостом закрыто.");
+      showRetry(true);
+      setOnlineStatus("Соединение с хостом закрыто. Нажмите «ПОВТОРИТЬ».");
       NET.started = false;
     });
-    conn.on("error", () => setOnlineStatus("Ошибка соединения."));
+    conn.on("error", () => {
+      showRetry(true);
+      setOnlineStatus("Ошибка соединения. Нажмите «ПОВТОРИТЬ».");
+    });
   });
-  peer.on("error", err => setOnlineStatus("Ошибка сети: " + (err.type || "peer")));
+  peer.on("error", err => {
+    showRetry(true);
+    setOnlineStatus("Ошибка сети: " + (err.type || "peer") + ". Нажмите «ПОВТОРИТЬ».");
+  });
   peer.on("disconnected", () => {
-    setOnlineStatus("Связь с сигнальным сервером потеряна, переподключаемся…");
+    showRetry(true);
+    setOnlineStatus("Связь с сервером комнат потеряна, переподключаемся…");
     setTimeout(() => { try { if (!peer.destroyed) peer.reconnect(); } catch (e) { /* ignore */ } }, 900);
   });
 }
@@ -1245,6 +1267,44 @@ function leaveRoom() {
   NET.started = false;
   $("#restartBtn").disabled = false;
   location.reload();
+}
+
+function resetOnlineState() {
+  try { if (NET.conn) NET.conn.close(); } catch (e) { /* ignore */ }
+  try { if (NET.peer) NET.peer.destroy(); } catch (e) { /* ignore */ }
+  NET.role = null;
+  NET.conn = null;
+  NET.peer = null;
+  NET.conns = [];
+  NET.creating = false;
+  NET.code = "";
+  NET.playerId = 0;
+  NET.lobby = [];
+  NET.started = false;
+  showRetry(false);
+  $("#startRoomBtn").style.display = "none";
+  $("#leaveRoomBtn").style.display = "none";
+  $("#createRoomBtn").style.display = "inline-block";
+  $("#joinRoomBtn").disabled = false;
+  $("#roomCodeInput").disabled = false;
+  renderLobby();
+}
+
+function retryOnline() {
+  const wasHost = NET.role === "host";
+  const wasGuest = NET.role === "guest";
+  const code = NET.code || $("#roomCodeInput").value;
+  resetOnlineState();
+  if (wasHost) {
+    setOnlineStatus("Создаём новую комнату…");
+    createRoom();
+  } else if (wasGuest) {
+    $("#roomCodeInput").value = code;
+    setOnlineStatus("Повторное подключение к " + code + "…");
+    joinRoom();
+  } else {
+    setOnlineStatus("Создайте комнату или войдите по коду.");
+  }
 }
 
 /* ---------- sound ---------- */
@@ -1613,6 +1673,7 @@ function bindEvents() {
   $("#createRoomBtn").addEventListener("click", createRoom);
   $("#joinRoomBtn").addEventListener("click", joinRoom);
   $("#startRoomBtn").addEventListener("click", startOnlineGame);
+  $("#retryOnlineBtn").addEventListener("click", retryOnline);
   $("#leaveRoomBtn").addEventListener("click", leaveRoom);
   $("#roomCodeInput").addEventListener("input", e => {
     e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4);
